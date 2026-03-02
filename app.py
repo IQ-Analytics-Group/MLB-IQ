@@ -4,9 +4,6 @@ import requests
 from datetime import date
 
 
-# -----------------------------
-# Page Config
-# -----------------------------
 st.set_page_config(page_title="MLB IQ", layout="wide")
 st.title("⚾ MLB IQ")
 st.subheader("Baseball Analytics & Game Intelligence")
@@ -15,17 +12,28 @@ st.subheader("Baseball Analytics & Game Intelligence")
 # -----------------------------
 # HTTP Helpers
 # -----------------------------
-def _get_json(url: str) -> dict:
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    return r.json()
+HEADERS = {
+    "User-Agent": "MLB-IQ/1.0 (Streamlit; contact: team)"
+}
 
 
-def _safe_first_split(stats_payload: dict) -> dict:
+def _get_json(url: str) -> dict | None:
     """
-    MLB Stats API stats payload often looks like:
-    {"stats":[{"splits":[{"stat": {...}}]}]}
+    Returns JSON dict, or None if 404/empty.
     """
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=25)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def _safe_first_split(stats_payload: dict | None) -> dict:
+    if not stats_payload:
+        return {}
     try:
         splits = stats_payload["stats"][0]["splits"]
         if not splits:
@@ -35,8 +43,15 @@ def _safe_first_split(stats_payload: dict) -> dict:
         return {}
 
 
+def _to_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
 # -----------------------------
-# Schedule + Team + Pitcher Data
+# Schedule
 # -----------------------------
 @st.cache_data(ttl=300)
 def fetch_today_schedule() -> pd.DataFrame:
@@ -49,12 +64,13 @@ def fetch_today_schedule() -> pd.DataFrame:
     data = _get_json(url)
 
     games = []
-    if not data.get("dates"):
+    if not data or not data.get("dates"):
         return pd.DataFrame(games)
 
     for g in data["dates"][0].get("games", []):
         away_team = g["teams"]["away"]["team"]["name"]
         home_team = g["teams"]["home"]["team"]["name"]
+
         away_id = g["teams"]["away"]["team"]["id"]
         home_id = g["teams"]["home"]["team"]["id"]
 
@@ -79,26 +95,49 @@ def fetch_today_schedule() -> pd.DataFrame:
     return pd.DataFrame(games)
 
 
+# -----------------------------
+# Team Stats (FIXED with fallbacks)
+# -----------------------------
 @st.cache_data(ttl=3600)
 def fetch_team_season_stats(team_id: int) -> dict:
-    hit_url = (
-        f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats"
-        "?stats=season&group=hitting"
-    )
-    pit_url = (
-        f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats"
-        "?stats=season&group=pitching"
-    )
+    """
+    Fetch team season stats with multiple fallback URL patterns.
+    If MLB endpoint returns 404, we return Nones and keep app running.
+    """
+    season_year = date.today().year
 
-    hit_data = _get_json(hit_url)
-    pit_data = _get_json(pit_url)
+    hit_urls = [
+        f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=hitting",
+        f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=hitting&sportId=1",
+        f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=hitting&season={season_year}",
+        f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=hitting&sportId=1&season={season_year}",
+    ]
+
+    pit_urls = [
+        f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=pitching",
+        f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=pitching&sportId=1",
+        f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=pitching&season={season_year}",
+        f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season&group=pitching&sportId=1&season={season_year}",
+    ]
+
+    hit_data = None
+    for u in hit_urls:
+        hit_data = _get_json(u)
+        if hit_data:
+            break
+
+    pit_data = None
+    for u in pit_urls:
+        pit_data = _get_json(u)
+        if pit_data:
+            break
 
     hit = _safe_first_split(hit_data)
     pit = _safe_first_split(pit_data)
 
-    runs = hit.get("runs", 0)
-    games_played = hit.get("gamesPlayed", 0)
-    ops = hit.get("ops", None)
+    runs = hit.get("runs")
+    games_played = hit.get("gamesPlayed")
+    ops = hit.get("ops")
 
     r_per_game = None
     if isinstance(runs, (int, float)) and isinstance(games_played, (int, float)) and games_played:
@@ -111,90 +150,65 @@ def fetch_team_season_stats(team_id: int) -> dict:
         "ops": ops,
         "team_era": pit.get("era"),
         "team_whip": pit.get("whip"),
+        "ok": bool(hit or pit),
     }
 
 
+# -----------------------------
+# Pitcher + Player Stats
+# -----------------------------
 @st.cache_data(ttl=3600)
 def fetch_pitcher_season_stats(player_id: int) -> dict:
-    url = (
-        f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
-        "?stats=season&group=pitching"
-    )
+    url = f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats?stats=season&group=pitching"
     data = _get_json(url)
     pit = _safe_first_split(data)
     if not pit:
         return {}
-
     return {
         "era": pit.get("era"),
         "whip": pit.get("whip"),
         "ip": pit.get("inningsPitched"),
         "k": pit.get("strikeOuts"),
-        "bb": pit.get("baseOnBalls"),
-        "h": pit.get("hits"),
-        "hr": pit.get("homeRuns"),
-        "games": pit.get("gamesPlayed"),
         "saves": pit.get("saves"),
+        "games": pit.get("gamesPlayed"),
     }
 
 
-# -----------------------------
-# Player Search (Roster) + Player Stats
-# -----------------------------
 @st.cache_data(ttl=900)
 def fetch_active_roster(team_id: int) -> list[dict]:
-    """
-    Pull active roster for a team.
-    Returns list of dicts: {id, name, position, team_id}
-    """
     url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster?rosterType=active"
     data = _get_json(url)
     roster = []
+    if not data:
+        return roster
 
     for p in data.get("roster", []):
         person = p.get("person", {})
         pos = p.get("position", {})
-        roster.append(
-            {
-                "player_id": person.get("id"),
-                "name": person.get("fullName"),
-                "position": pos.get("abbreviation") or pos.get("name"),
-                "team_id": team_id,
-            }
-        )
-
-    # Remove blanks
-    roster = [x for x in roster if x.get("player_id") and x.get("name")]
+        if person.get("id") and person.get("fullName"):
+            roster.append(
+                {
+                    "player_id": person.get("id"),
+                    "name": person.get("fullName"),
+                    "position": pos.get("abbreviation") or pos.get("name"),
+                    "team_id": team_id,
+                }
+            )
     return roster
 
 
 @st.cache_data(ttl=3600)
 def fetch_player_hitting_season(player_id: int) -> dict:
-    url = (
-        f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
-        "?stats=season&group=hitting"
-    )
+    url = f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats?stats=season&group=hitting"
     data = _get_json(url)
-    hit = _safe_first_split(data)
-    return hit or {}
+    return _safe_first_split(data)
 
 
 @st.cache_data(ttl=3600)
 def fetch_player_pitching_season(player_id: int) -> dict:
-    url = (
-        f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
-        "?stats=season&group=pitching"
-    )
+    url = f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats?stats=season&group=pitching"
     data = _get_json(url)
-    pit = _safe_first_split(data)
-    return pit or {}
-
-
-def _to_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
+    return _safe_first_split(data)
 
 
 def _lean_higher_lower(proj: float | None, line: float | None) -> str:
@@ -207,24 +221,6 @@ def _lean_higher_lower(proj: float | None, line: float | None) -> str:
     return "Lean: Even"
 
 
-def _build_season_prop_projection(hitting: dict, pitching: dict, prop_key: str) -> float | None:
-    """
-    Simple baseline projection:
-    Uses current season total directly (not end-of-season projection),
-    because we don't have full season pace + games remaining in a stable way.
-    For Underdog-style season props, you'll likely want:
-      - current total
-      - pace (per game)
-      - projected end-of-season (pace * 162)
-    We'll show pace + 162-projection where possible.
-    """
-    if prop_key in ("homeRuns", "stolenBases"):
-        return _to_float(hitting.get(prop_key))
-    if prop_key in ("saves", "strikeOuts"):
-        return _to_float(pitching.get(prop_key))
-    return None
-
-
 def _pace_and_162_projection(total: float | None, games_played: float | None) -> tuple[float | None, float | None]:
     if total is None or games_played in (None, 0):
         return None, None
@@ -234,14 +230,9 @@ def _pace_and_162_projection(total: float | None, games_played: float | None) ->
 
 
 # -----------------------------
-# UI: Select Game
+# Main UI
 # -----------------------------
-try:
-    games_df = fetch_today_schedule()
-except Exception as e:
-    st.error(f"Schedule fetch failed: {e}")
-    st.stop()
-
+games_df = fetch_today_schedule()
 if games_df.empty:
     st.warning("No MLB games found for today.")
     st.stop()
@@ -255,30 +246,24 @@ home_team = game["home_team"]
 away_id = int(game["away_team_id"])
 home_id = int(game["home_team_id"])
 
-# Team stats
-try:
-    away_team_stats = fetch_team_season_stats(away_id)
-    home_team_stats = fetch_team_season_stats(home_id)
-except Exception as e:
-    st.error(f"Team stats fetch failed: {e}")
-    st.stop()
+away_team_stats = fetch_team_season_stats(away_id)
+home_team_stats = fetch_team_season_stats(home_id)
 
-# Pitcher stats (probables)
+# Don't stop the app if stats fail — just warn
+if not away_team_stats.get("ok") or not home_team_stats.get("ok"):
+    st.warning(
+        "Team stats endpoint is returning limited data right now. "
+        "The app will still run (Player Finder + Pick Builder will work)."
+    )
+
+# Probable pitchers
 away_prob_pit = {}
 home_prob_pit = {}
 if pd.notna(game.get("away_pitcher_id")):
-    try:
-        away_prob_pit = fetch_pitcher_season_stats(int(game["away_pitcher_id"]))
-    except Exception:
-        away_prob_pit = {}
-
+    away_prob_pit = fetch_pitcher_season_stats(int(game["away_pitcher_id"])) or {}
 if pd.notna(game.get("home_pitcher_id")):
-    try:
-        home_prob_pit = fetch_pitcher_season_stats(int(game["home_pitcher_id"]))
-    except Exception:
-        home_prob_pit = {}
+    home_prob_pit = fetch_pitcher_season_stats(int(game["home_pitcher_id"])) or {}
 
-# Display matchup summary
 c1, c2 = st.columns(2)
 
 with c1:
@@ -286,10 +271,7 @@ with c1:
     st.markdown(f"**{away_team}**")
     st.write("**Probable Pitcher:**", game["away_pitcher"])
     if away_prob_pit:
-        st.caption(
-            f"ERA: {away_prob_pit.get('era','—')} | WHIP: {away_prob_pit.get('whip','—')} | "
-            f"IP: {away_prob_pit.get('ip','—')} | K: {away_prob_pit.get('k','—')}"
-        )
+        st.caption(f"ERA: {away_prob_pit.get('era','—')} | WHIP: {away_prob_pit.get('whip','—')} | K: {away_prob_pit.get('k','—')}")
     st.write("---")
     st.write("**Team Snapshot (Season):**")
     st.write(f"Runs/Game: {away_team_stats.get('r_per_game','—')}")
@@ -302,10 +284,7 @@ with c2:
     st.markdown(f"**{home_team}**")
     st.write("**Probable Pitcher:**", game["home_pitcher"])
     if home_prob_pit:
-        st.caption(
-            f"ERA: {home_prob_pit.get('era','—')} | WHIP: {home_prob_pit.get('whip','—')} | "
-            f"IP: {home_prob_pit.get('ip','—')} | K: {home_prob_pit.get('k','—')}"
-        )
+        st.caption(f"ERA: {home_prob_pit.get('era','—')} | WHIP: {home_prob_pit.get('whip','—')} | K: {home_prob_pit.get('k','—')}")
     st.write("---")
     st.write("**Team Snapshot (Season):**")
     st.write(f"Runs/Game: {home_team_stats.get('r_per_game','—')}")
@@ -317,10 +296,10 @@ st.divider()
 
 
 # -----------------------------
-# Player Finder (Searchable dropdown)
+# Player Finder (Searchable Dropdown)
 # -----------------------------
 st.subheader("Player Finder (Type to Search)")
-st.caption("Click the dropdown and start typing a player name (searchable).")
+st.caption("Click the dropdown and start typing a player name.")
 
 with st.spinner("Loading rosters..."):
     away_roster = fetch_active_roster(away_id)
@@ -332,14 +311,11 @@ for p in away_roster:
 for p in home_roster:
     players.append({**p, "team_name": home_team})
 
-players = [p for p in players if p.get("player_id") and p.get("name")]
-players = sorted(players, key=lambda x: x["name"].lower())
-
+players = sorted([p for p in players if p.get("player_id") and p.get("name")], key=lambda x: x["name"].lower())
 if not players:
     st.warning("Could not load rosters for this matchup.")
     st.stop()
 
-# Build a label so it looks good in the dropdown
 def _player_label(p: dict) -> str:
     pos = p.get("position") or ""
     team = p.get("team_name") or ""
@@ -356,15 +332,11 @@ player_id = int(selected_player["player_id"])
 player_name = selected_player["name"]
 player_team = selected_player["team_name"]
 player_pos = selected_player.get("position", "—")
-
 st.write(f"**Selected:** {player_name} ({player_team}) — {player_pos}")
 
-# Pull both hitting and pitching; some players will have one empty
-with st.spinner("Loading player season stats..."):
-    hit = fetch_player_hitting_season(player_id)
-    pit = fetch_player_pitching_season(player_id)
+hit = fetch_player_hitting_season(player_id) or {}
+pit = fetch_player_pitching_season(player_id) or {}
 
-# Show quick stat cards
 st.divider()
 st.subheader("Season Snapshot (Player)")
 
@@ -373,29 +345,29 @@ colA, colB = st.columns(2)
 with colA:
     st.markdown("#### Hitting")
     if not hit:
-        st.info("No hitting stats found (or not available).")
+        st.info("No hitting stats found.")
     else:
         st.write(f"Games: {hit.get('gamesPlayed','—')}")
-        st.write(f"AVG: {hit.get('avg','—')} | OBP: {hit.get('obp','—')} | SLG: {hit.get('slg','—')} | OPS: {hit.get('ops','—')}")
-        st.write(f"HR: {hit.get('homeRuns','—')} | SB: {hit.get('stolenBases','—')} | RBI: {hit.get('rbi','—')} | R: {hit.get('runs','—')}")
+        st.write(f"AVG: {hit.get('avg','—')} | OPS: {hit.get('ops','—')}")
+        st.write(f"HR: {hit.get('homeRuns','—')} | SB: {hit.get('stolenBases','—')} | RBI: {hit.get('rbi','—')}")
 
 with colB:
     st.markdown("#### Pitching")
     if not pit:
-        st.info("No pitching stats found (or not available).")
+        st.info("No pitching stats found.")
     else:
         st.write(f"Games: {pit.get('gamesPlayed','—')} | GS: {pit.get('gamesStarted','—')}")
         st.write(f"ERA: {pit.get('era','—')} | WHIP: {pit.get('whip','—')} | IP: {pit.get('inningsPitched','—')}")
-        st.write(f"K: {pit.get('strikeOuts','—')} | BB: {pit.get('baseOnBalls','—')} | HR: {pit.get('homeRuns','—')} | Saves: {pit.get('saves','—')}")
+        st.write(f"K: {pit.get('strikeOuts','—')} | Saves: {pit.get('saves','—')}")
 
 st.divider()
 
 
 # -----------------------------
-# Pick Builder (Underdog-style)
+# Pick Builder (Season Props)
 # -----------------------------
 st.subheader("Pick Builder (Season Props)")
-st.caption("Enter a line (like Underdog) and MLB IQ will show a quick baseline + lean. This is a starting point; we’ll add ML next.")
+st.caption("Enter a line (like Underdog) and MLB IQ will show a quick pace-based lean.")
 
 prop_map = {
     "Season Home Runs": ("homeRuns", "hitting"),
@@ -409,18 +381,18 @@ prop_key, prop_group = prop_map[prop_choice]
 
 line = st.number_input("Enter the line", min_value=0.0, step=0.5, value=0.0)
 
-# Build baseline
-season_total = _build_season_prop_projection(hit, pit, prop_key)
-
-# Games played needed for pace
+season_total = None
 games_played = None
+
 if prop_group == "hitting":
+    season_total = _to_float(hit.get(prop_key))
     games_played = _to_float(hit.get("gamesPlayed"))
 else:
+    season_total = _to_float(pit.get(prop_key))
     games_played = _to_float(pit.get("gamesPlayed"))
 
 pace, proj_162 = _pace_and_162_projection(season_total, games_played)
-lean = _lean_higher_lower(proj_162, line) if proj_162 is not None and line is not None else "—"
+lean = _lean_higher_lower(proj_162, line) if proj_162 is not None else "—"
 
 m1, m2, m3 = st.columns(3)
 m1.metric("Current Season Total", "—" if season_total is None else round(season_total, 1))
@@ -428,7 +400,3 @@ m2.metric("Per-Game Pace", "—" if pace is None else pace)
 m3.metric("162-Game Projection", "—" if proj_162 is None else proj_162)
 
 st.write("**Suggestion:**", lean)
-
-st.caption(
-    "Important: This is a simple pace-based baseline. Next step is adding opponent/pitcher context, park factors, and ML models trained on historical data."
-)
